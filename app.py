@@ -154,6 +154,8 @@ def meta(kind, key, title, **fields):
 def show_record(series):
     ident = series["id"]
     tr = translated(series, language())
+    local = series.get("_localized") or {}
+    tr = {k: local.get(k) or tr.get(k) for k in ("name", "overview")}
     poster = image_url(series)
     date = series.get("firstAired")
     result = meta("show", key_show(ident), tr.get("name") or name(series),
@@ -194,7 +196,23 @@ def episode_record(series_id, episode, show_title=""):
 
 
 def show(series_id):
-    return tvdb("/series/" + str(series_id) + "/extended", {"meta": "translations"}).get("data") or {}
+    series = tvdb("/series/" + str(series_id) + "/extended", {"meta": "translations"}).get("data") or {}
+    lang = language()
+    existing = translated(series, lang)
+    # The embedded translation list may be incomplete. The dedicated API route
+    # provides the authoritative translation when one exists.
+    if lang != "eng" and (not existing.get("name") or not existing.get("overview")):
+        try:
+            response = tvdb("/series/" + str(series_id) + "/translations/" + quote(lang, safe=""))
+            record = response.get("data") or {}
+            if isinstance(record, list):
+                record = next((x for x in record if isinstance(x, dict) and x.get("language") == lang), {})
+            if isinstance(record, dict):
+                series["_localized"] = {"name": record.get("name"), "overview": record.get("overview")}
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code not in (400, 404):
+                raise
+    return series
 
 
 def episodes(series_id):
