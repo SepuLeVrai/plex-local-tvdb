@@ -11,6 +11,22 @@ class ProviderTests(unittest.TestCase):
     def setUp(self):
         self.client = provider.app.test_client()
 
+    def test_language_normalization_without_duplicate_suffix(self):
+        self.assertEqual(provider.normalize_language("fra"), "fra")
+        self.assertEqual(provider.normalize_language("fr-FR"), "fra")
+        self.assertEqual(provider.normalize_language("eng"), "eng")
+        self.assertEqual(provider.normalize_language("en-US"), "eng")
+
+    def test_forced_language_ignores_plex_header(self):
+        with patch.dict(os.environ, {"TVDB_FORCE_LANGUAGE": "true"}):
+            with provider.app.test_request_context(headers={"X-Plex-Language": "en-US"}):
+                self.assertEqual(provider.language(), "fra")
+
+    def test_unforced_language_uses_plex_header(self):
+        with patch.dict(os.environ, {"TVDB_FORCE_LANGUAGE": "false"}):
+            with provider.app.test_request_context(headers={"X-Plex-Language": "en-US"}):
+                self.assertEqual(provider.language(), "eng")
+
     def test_health(self):
         self.assertEqual(self.client.get("/health").status_code, 200)
 
