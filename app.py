@@ -91,8 +91,6 @@ def translated(obj, lang):
     translations = obj.get("translations") or {}
     if not isinstance(translations, dict):
         return {}
-    for group in ("nameTranslations", "overviewTranslations"):
-        pass
     names = translations.get("nameTranslations") or []
     descriptions = translations.get("overviewTranslations") or []
     def find(items):
@@ -107,6 +105,29 @@ def name(obj):
 
 def image_url(obj):
     return obj.get("image") or obj.get("image_url") or obj.get("thumbnail")
+
+
+def artwork_assets(series):
+    assets = []
+    for art in series.get("artworks") or []:
+        url = art.get("image") or art.get("thumbnail")
+        t = art.get("type")
+        type_id = t.get("id") if isinstance(t, dict) else t
+        kind = {2: "coverPoster", 3: "background", 5: "clearLogo"}.get(type_id)
+        if url and kind:
+            assets.append({"type": kind, "url": url, "alt": name(series)})
+    poster = image_url(series)
+    if poster and not any(a["type"] == "coverPoster" for a in assets):
+        assets.insert(0, {"type": "coverPoster", "url": poster, "alt": name(series)})
+    return assets
+
+
+def with_images(record, assets):
+    if assets:
+        record["Image"] = assets
+        record["thumb"] = next((a["url"] for a in assets if a["type"] in ("coverPoster", "snapshot")), record.get("thumb"))
+        record["art"] = next((a["url"] for a in assets if a["type"] == "background"), record.get("art"))
+    return record
 
 
 def guid(kind, key):
@@ -138,18 +159,19 @@ def show_record(series):
     result = meta("show", key_show(ident), tr.get("name") or name(series),
                   summary=tr.get("overview") or series.get("overview"),
                   year=int(date[:4]) if date and date[:4].isdigit() else None,
-                  originallyAvailableAt=date, thumb=poster, art=poster,
+                  originallyAvailableAt=date, thumb=poster,
                   Guid=[{"id": "tvdb://" + str(ident)}])
-    return result
+    return with_images(result, artwork_assets(series))
 
 
-def season_record(series_id, number, show_title=""):
+def season_record(series_id, number, show_title="", poster=None):
     k = key_season(series_id, number)
     return meta("season", k, "Specials" if number == 0 else "Season " + str(number),
                 index=number, parentRatingKey=key_show(series_id),
                 parentGuid=guid("show", key_show(series_id)),
                 parentKey="/tv/library/metadata/" + key_show(series_id),
-                parentTitle=show_title, parentType="show")
+                parentTitle=show_title, parentType="show", thumb=poster,
+                Image=[{"type": "coverPoster", "url": poster}] if poster else None)
 
 
 def episode_record(series_id, episode, show_title=""):
@@ -157,9 +179,11 @@ def episode_record(series_id, episode, show_title=""):
     number = int(episode.get("number") or 0)
     k = key_episode(series_id, season, number)
     date = episode.get("aired")
+    still = image_url(episode)
     return meta("episode", k, name(episode), index=number, parentIndex=season,
                 summary=episode.get("overview"), originallyAvailableAt=date,
-                thumb=image_url(episode), parentRatingKey=key_season(series_id, season),
+                thumb=still, Image=[{"type": "snapshot", "url": still}] if still else None,
+                parentRatingKey=key_season(series_id, season),
                 parentKey="/tv/library/metadata/" + key_season(series_id, season),
                 parentGuid=guid("season", key_season(series_id, season)), parentType="season",
                 parentTitle="Season " + str(season),
@@ -178,8 +202,8 @@ def episodes(series_id):
     seen = set()
     page = 0
     while page < 100:
-        result = tvdb("/series/" + str(series_id) + "/episodes/" + quote(ORDER, safe=""),
-                      {"page": page})
+        result = tvdb("/series/" + str(series_id) + "/episodes/" + quote(ORDER, safe="") +
+                      "/" + quote(language(), safe=""), {"page": page})
         data = result.get("data") or {}
         items = data.get("episodes") or []
         for ep in items:
@@ -275,7 +299,7 @@ def fetch_metadata(key):
     if kind == "show":
         return show_record(series)
     if kind == "season":
-        return season_record(sid, season, name(series))
+        return season_record(sid, season, name(series), show_record(series).get("thumb"))
     item = next((e for e in episodes(sid)
                  if int(e.get("seasonNumber") or 0) == season
                  and int(e.get("number") or 0) == number), None)
@@ -305,9 +329,11 @@ def get_children(key):
     kind, sid, season, number = parse_key(key)
     data = episodes(sid)
     if kind == "show":
-        return [season_record(sid, n) for n in sorted({int(ep.get("seasonNumber") or 0) for ep in data})]
+        series = show(sid)
+        return [season_record(sid, n, name(series), show_record(series).get("thumb")) for n in sorted({int(ep.get("seasonNumber") or 0) for ep in data})]
     if kind == "season":
-        return [episode_record(sid, ep) for ep in data if int(ep.get("seasonNumber") or 0) == season]
+        series = show(sid)
+        return [episode_record(sid, ep, name(series)) for ep in data if int(ep.get("seasonNumber") or 0) == season]
     return []
 
 
@@ -328,7 +354,7 @@ def grandchildren(key):
         kind, sid, _, _ = parse_key(key)
         if kind != "show":
             return jsonify(paging([]))
-        return jsonify(paging([episode_record(sid, ep) for ep in episodes(sid)]))
+        return jsonify(paging([episode_record(sid, ep, name(show(sid))) for ep in episodes(sid)]))
     except ValueError:
         return jsonify({"error": "invalid rating key"}), 400
     except (requests.RequestException, RuntimeError) as exc:
@@ -342,11 +368,11 @@ def images(key):
         item = fetch_metadata(key)
         if item is None:
             return jsonify({"error": "not found"}), 404
-        images = []
-        for field, kind in (("thumb", "coverPoster"), ("art", "background")):
-            if item.get(field):
-                images.append({"type": kind, "url": item[field], "alt": item["title"]})
-        return jsonify({"MediaContainer": {"size": len(images), "totalSize": len(images),
+        images = item.get("Image") or []
+        if not images and item.get("thumb"):
+            kind = "snapshot" if item["type"] == "episode" else "coverPoster"
+            images = [{"type": kind, "url": item["thumb"], "alt": item["title"]}]
+        return jsonify({"MediaContainer": {"offset": 0, "size": len(images), "totalSize": len(images),
                                            "identifier": IDENT, "Image": images}})
     except ValueError:
         return jsonify({"error": "invalid rating key"}), 400
