@@ -202,8 +202,14 @@ def episodes(series_id):
     seen = set()
     page = 0
     while page < 100:
-        result = tvdb("/series/" + str(series_id) + "/episodes/" + quote(ORDER, safe="") +
-                      "/" + quote(language(), safe=""), {"page": page})
+        base_path = "/series/" + str(series_id) + "/episodes/" + quote(ORDER, safe="")
+        try:
+            result = tvdb(base_path + "/" + quote(language(), safe=""), {"page": page})
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code not in (400, 404):
+                raise
+            # Some series have no translation for the requested language.
+            result = tvdb(base_path, {"page": page})
         data = result.get("data") or {}
         items = data.get("episodes") or []
         for ep in items:
