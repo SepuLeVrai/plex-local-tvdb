@@ -82,9 +82,17 @@ def tvdb(path, params=None):
     raise RuntimeError("TheTVDB authentication failed")
 
 
+def normalize_language(value):
+    """Normalize Plex locale (fr-FR) or TVDB code (fra) without corrupting it."""
+    code = (value or "fra").strip().lower().replace("_", "-").split("-")[0]
+    return {"fr": "fra", "en": "eng", "de": "deu", "es": "spa",
+            "it": "ita", "pt": "por"}.get(code, code)
+
+
 def language():
-    value = request.headers.get("X-Plex-Language", LANG)
-    return (value.split("-")[0] or LANG).lower().replace("fr", "fra").replace("en", "eng")
+    if os.getenv("TVDB_FORCE_LANGUAGE", "true").lower() in ("1", "true", "yes", "on"):
+        return normalize_language(LANG)
+    return normalize_language(request.headers.get("X-Plex-Language") or LANG)
 
 
 def translated(obj, lang):
