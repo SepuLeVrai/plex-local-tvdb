@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 import logging
+from difflib import SequenceMatcher
 from urllib.parse import quote
 
 import requests
@@ -115,9 +116,86 @@ def image_url(obj):
     return obj.get("image") or obj.get("image_url") or obj.get("thumbnail")
 
 
+def preferred_artworks(items, lang=None, limit=40):
+    """Return URL-deduplicated artwork, French first, then language-neutral.
+    TVDB artwork type ids: series poster=2, background=3, icon=5.
+    Season artwork uses season-specific artwork records, not series posters.
+    """
+    lang = lang or language()
+    def priority(item):
+        code = normalize_language(item.get("language") or "")
+        return (0 if code == lang else 1 if not code else 2 if code == "eng" else 3,
+                -float(item.get("score") or 0))
+    return sorted([i for i in items if isinstance(i, dict) and (i.get("image") or i.get("thumbnail"))],
+                  key=priority)[:limit]
+
+
+def season_poster_assets(season):
+    """TVDB season extended has 'artwork'; series.seasons may have a direct image."""
+    candidates = season.get("artwork") or season.get("artworks") or []
+    images = []
+    seen = set()
+    for art in preferred_artworks(candidates, limit=30):
+        url = art.get("image") or art.get("thumbnail")
+        kind = "coverPoster"
+        atype = art.get("type")
+        if isinstance(atype, dict):
+            atype = atype.get("id")
+        # Season artwork types vary from series types; use the canonical direct
+        # season poster and season artwork's own type where recognizable.
+        if atype in (8, 9, 12):
+            kind = "background"
+        if url not in seen:
+            images.append({"type": kind, "url": url, "alt": season.get("name") or "Season"})
+            seen.add(url)
+    direct = image_url(season)
+    if direct and direct not in seen:
+        images.insert(0, {"type": "coverPoster", "url": direct, "alt": season.get("name") or "Season"})
+    return images
+
+
+def season_source(series, number, order=None):
+    """Find the matching season in the requested TVDB season type.
+    Never substitute an absolute/DVDrip season with an unrelated season."""
+    candidates = [x for x in (series.get("seasons") or [])
+                  if isinstance(x, dict) and int(x.get("number") or 0) == number]
+    if not candidates:
+        return None
+    order = order or ORDER
+    variants = {"default": ("official", "default", "aired"),
+                "official": ("official", "default", "aired"),
+                "dvd": ("dvd",), "absolute": ("absolute",),
+                "alternate": ("alternate",), "regional": ("regional",),
+                "altdvd": ("altdvd",), "alttwo": ("alttwo",)}
+    allowed = variants.get(order, (order,))
+    for candidate in candidates:
+        typ = candidate.get("type") or {}
+        value = typ.get("type") if isinstance(typ, dict) else typ
+        if str(value).lower() in allowed:
+            return candidate
+    if order in ("official", "default"):
+        return candidates[0]
+    return None
+
+
+def season_details(series, number):
+    source = season_source(series, number)
+    if not source:
+        return None
+    ident = source.get("id")
+    if not ident:
+        return source
+    try:
+        return tvdb("/seasons/" + str(int(ident)) + "/extended", {"meta": "translations"}).get("data") or source
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in (400, 404):
+            return source
+        raise
+
+
 def artwork_assets(series):
     assets = []
-    for art in series.get("artworks") or []:
+    for art in preferred_artworks(series.get("artworks") or [], limit=60):
         url = art.get("image") or art.get("thumbnail")
         t = art.get("type")
         type_id = t.get("id") if isinstance(t, dict) else t
@@ -174,14 +252,24 @@ def show_record(series):
     return with_images(result, artwork_assets(series))
 
 
-def season_record(series_id, number, show_title="", poster=None):
+def season_record(series_id, number, show_title="", poster=None, season=None):
     k = key_season(series_id, number)
-    return meta("season", k, "Specials" if number == 0 else "Season " + str(number),
-                index=number, parentRatingKey=key_show(series_id),
-                parentGuid=guid("show", key_show(series_id)),
-                parentKey="/tv/library/metadata/" + key_show(series_id),
-                parentTitle=show_title, parentType="show", thumb=poster,
-                Image=[{"type": "coverPoster", "url": poster}] if poster else None)
+    season = season or {}
+    localized = translated(season, language())
+    title = localized.get("name") or season.get("name") or (
+        "Épisodes spéciaux" if number == 0 and language() == "fra" else
+        "Specials" if number == 0 else
+        "Saison " + str(number) if language() == "fra" else "Season " + str(number))
+    result = meta("season", k, title,
+                  index=number, parentRatingKey=key_show(series_id),
+                  parentGuid=guid("show", key_show(series_id)),
+                  parentKey="/tv/library/metadata/" + key_show(series_id),
+                  parentTitle=show_title, parentType="show",
+                  summary=localized.get("overview") or season.get("overview"))
+    assets = season_poster_assets(season)
+    if not any(a["type"] == "coverPoster" for a in assets) and poster:
+        assets.append({"type": "coverPoster", "url": poster, "alt": title})
+    return with_images(result, assets)
 
 
 def episode_record(series_id, episode, show_title=""):
@@ -282,7 +370,7 @@ def health():
 @app.get("/tv")
 def provider():
     return jsonify({"MediaProvider": {
-        "identifier": IDENT, "title": "Plex Local TVDB", "version": "0.1.0",
+        "identifier": IDENT, "title": "Plex Local TVDB", "version": "0.2.0",
         "Types": [{"type": t, "Scheme": [{"scheme": IDENT}]} for t in (2, 3, 4)],
         "Feature": [{"type": "metadata", "key": "/library/metadata"},
                     {"type": "match", "key": "/library/metadata/matches"}]
@@ -331,7 +419,8 @@ def fetch_metadata(key):
     if kind == "show":
         return show_record(series)
     if kind == "season":
-        return season_record(sid, season, name(series), show_record(series).get("thumb"))
+        return season_record(sid, season, name(series), show_record(series).get("thumb"),
+                             season_details(series, season))
     item = next((e for e in episodes(sid)
                  if int(e.get("seasonNumber") or 0) == season
                  and int(e.get("number") or 0) == number), None)
@@ -362,7 +451,9 @@ def get_children(key):
     data = episodes(sid)
     if kind == "show":
         series = show(sid)
-        return [season_record(sid, n, name(series), show_record(series).get("thumb")) for n in sorted({int(ep.get("seasonNumber") or 0) for ep in data})]
+        poster = show_record(series).get("thumb")
+        return [season_record(sid, n, name(series), poster, season_source(series, n))
+                for n in sorted({int(ep.get("seasonNumber") or 0) for ep in data})]
     if kind == "season":
         series = show(sid)
         return [episode_record(sid, ep, name(series)) for ep in data if int(ep.get("seasonNumber") or 0) == season]
