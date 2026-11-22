@@ -137,14 +137,12 @@ def season_poster_assets(season):
     seen = set()
     for art in preferred_artworks(candidates, limit=30):
         url = art.get("image") or art.get("thumbnail")
-        kind = "coverPoster"
         atype = art.get("type")
         if isinstance(atype, dict):
             atype = atype.get("id")
-        # Season artwork types vary from series types; use the canonical direct
-        # season poster and season artwork's own type where recognizable.
-        if atype in (8, 9, 12):
-            kind = "background"
+        kind = {7: "coverPoster", 8: "background", 10: "clearLogo"}.get(atype)
+        if kind is None:
+            continue  # Avoid using wide banners and episode stills as posters.
         if url not in seen:
             images.append({"type": kind, "url": url, "alt": season.get("name") or "Season"})
             seen.add(url)
