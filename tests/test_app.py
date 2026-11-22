@@ -22,6 +22,20 @@ class ProviderTests(unittest.TestCase):
     def test_bad_rating_key(self):
         self.assertEqual(self.client.get("/tv/library/metadata/invalid").status_code, 400)
 
+    @patch.object(provider, "tvdb")
+    def test_series_french_translation_dedicated_endpoint(self, mock_tvdb):
+        def api(path, params=None):
+            if path.endswith("/extended"):
+                return {"data": {"id": 99, "name": "English", "overview": "English overview"}}
+            if path.endswith("/translations/fra"):
+                return {"data": {"name": "Titre francais", "overview": "Resume en francais"}}
+            raise AssertionError(path)
+        mock_tvdb.side_effect = api
+        with provider.app.test_request_context(headers={"X-Plex-Language": "fr-FR"}):
+            item = provider.show_record(provider.show(99))
+        self.assertEqual(item["title"], "Titre francais")
+        self.assertEqual(item["summary"], "Resume en francais")
+
     def test_plex_artwork_types(self):
         series = {"id": 44, "name": "Demo", "image": "https://example.org/poster.jpg",
                   "artworks": [{"type": 3, "image": "https://example.org/background.jpg"}]}
