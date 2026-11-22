@@ -123,7 +123,7 @@ def preferred_artworks(items, lang=None, limit=40):
     """
     lang = lang or language()
     def priority(item):
-        code = normalize_language(item.get("language") or "")
+        code = normalize_language(item["language"]) if item.get("language") else ""
         return (0 if code == lang else 1 if not code else 2 if code == "eng" else 3,
                 -float(item.get("score") or 0))
     return sorted([i for i in items if isinstance(i, dict) and (i.get("image") or i.get("thumbnail"))],
@@ -357,7 +357,7 @@ def parse_key(key):
     if not m:
         raise ValueError("Invalid rating key")
     kind, sid, season, ep = m.groups()
-    if kind == "season" and season is None or kind == "episode" and ep is None:
+    if (kind == "season" and season is None) or (kind == "episode" and ep is None):
         raise ValueError("Invalid rating key")
     return kind, int(sid), int(season or 0), int(ep or 0)
 
@@ -398,10 +398,30 @@ def matches():
                     continue
         else:
             return jsonify(container([]))
+        # Prioritize exact series title and launch year. Manual searches still
+        # return the alternatives; automatic matching returns one best result.
+        query_title = str(title or "").strip().casefold()
+        target_year = body.get("year")
+        def rank(series):
+            translated_title = show_record(series)["title"].strip().casefold()
+            original = name(series).strip().casefold()
+            ratio = max(SequenceMatcher(None, query_title, translated_title).ratio(),
+                        SequenceMatcher(None, query_title, original).ratio())
+            date = str(series.get("firstAired") or "")
+            year = int(date[:4]) if date[:4].isdigit() else None
+            year_bonus = (1 if target_year and year == int(target_year) else
+                          -0.3 if target_year and year and abs(year-int(target_year)) > 1 else 0)
+            return ratio * 4 + year_bonus
+        if not match and query_title:
+            records.sort(key=rank, reverse=True)
+        if not body.get("manual") and records:
+            records = records[:1]
         found = [show_record(s) for s in records]
         kind = int(body.get("type", 2))
         if kind == 3:
-            found = [season_record(int(s["id"]), int(body.get("index") or 0), name(s)) for s in records]
+            found = [season_record(int(s["id"]), int(body.get("index") or 0), name(s),
+                                   show_record(s).get("thumb"),
+                                   season_source(s, int(body.get("index") or 0))) for s in records]
         if kind == 4:
             found = [episode_record(int(s["id"]), next((e for e in episodes(int(s["id"]))
                        if int(e.get("seasonNumber") or 0) == int(body.get("parentIndex") or 0)
