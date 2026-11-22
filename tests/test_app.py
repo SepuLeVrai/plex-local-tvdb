@@ -27,6 +27,51 @@ class ProviderTests(unittest.TestCase):
             with provider.app.test_request_context(headers={"X-Plex-Language": "en-US"}):
                 self.assertEqual(provider.language(), "eng")
 
+    def test_season_artwork_prefers_french_poster(self):
+        with provider.app.test_request_context():
+            src = {"name": "Season 1", "artwork": [
+                {"type": 7, "language": "eng", "image": "https://example.org/en.jpg", "score": 99},
+                {"type": 7, "language": "fra", "image": "https://example.org/fr.jpg", "score": 1},
+                {"type": 8, "language": "fra", "image": "https://example.org/bg.jpg"},
+                {"type": 6, "language": "fra", "image": "https://example.org/banner.jpg"}]}
+            item = provider.season_record(44, 1, "Example", "https://example.org/show.jpg", src)
+            self.assertEqual(item["thumb"], "https://example.org/fr.jpg")
+            self.assertEqual(item["art"], "https://example.org/bg.jpg")
+            self.assertNotIn("https://example.org/banner.jpg",
+                             [i["url"] for i in item["Image"]])
+
+    def test_season_type_selection(self):
+        src = {"seasons": [{"id": 10, "number": 1, "type": {"type": "official"}, "image": "official.jpg"},
+                           {"id": 20, "number": 1, "type": {"type": "dvd"}, "image": "dvd.jpg"}]}
+        self.assertEqual(provider.season_source(src, 1, "default")["id"], 10)
+        self.assertEqual(provider.season_source(src, 1, "dvd")["id"], 20)
+        self.assertIsNone(provider.season_source(src, 1, "absolute"))
+
+    @patch.object(provider, "tvdb")
+    def test_extended_season_artwork(self, mock_tvdb):
+        series = {"id": 44, "name": "Test", "seasons": [
+            {"id": 123, "number": 1, "type": {"type": "official"}}]}
+        mock_tvdb.return_value = {"data": {"id": 123, "name": "Saison 1",
+              "artwork": [{"type": 7, "language": "fra", "image": "https://example.org/s1.jpg"}]}}
+        with provider.app.test_request_context():
+            item = provider.season_record(44, 1, "Test", None, provider.season_details(series, 1))
+        self.assertEqual(item["thumb"], "https://example.org/s1.jpg")
+        self.assertIn("/seasons/123/extended", mock_tvdb.call_args.args[0])
+
+    @patch.object(provider, "show")
+    @patch.object(provider, "tvdb")
+    def test_automatic_match_prefers_year(self, mock_tvdb, mock_show):
+        mock_tvdb.return_value = {"data": [
+            {"id": "11"}, {"id": "22"}]}
+        mock_show.side_effect = lambda ident: {"id": ident, "name": "Same Title",
+                                    "firstAired": "2020-01-01" if ident == 11 else "2026-01-01"}
+        resp = self.client.post("/tv/library/metadata/matches",
+                                json={"type": 2, "title": "Same Title", "year": 2026})
+        self.assertEqual(resp.status_code, 200)
+        items = resp.json["MediaContainer"]["Metadata"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["ratingKey"], "tvdb-show-22")
+
     def test_health(self):
         self.assertEqual(self.client.get("/health").status_code, 200)
 
@@ -83,8 +128,10 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["MediaContainer"]["Metadata"][0]["title"], "Example")
 
+    @patch.object(provider, "show")
     @patch.object(provider, "episodes")
-    def test_season_children(self, mock_episodes):
+    def test_season_children(self, mock_episodes, mock_show):
+        mock_show.return_value = {"id": 1, "name": "Test Show", "seasons": []}
         mock_episodes.return_value = [
             {"id": 1, "seasonNumber": 1, "number": 2, "name": "Second"},
             {"id": 2, "seasonNumber": 2, "number": 1, "name": "First"}
